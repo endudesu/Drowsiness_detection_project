@@ -1,4 +1,9 @@
-*Click on each entry below to see additional information.*
+
+<summary>gankush's Fatigue Detection using Pose Estimation|<a href=https://github.com/wzafar/capstone-project/tree/mainlink</a></summary>
+
+
+
+*Datasets*
 <a name="HOIST"></a>
 <details close>
 <summary>HOIST | <a href=https://doi.org/10.1109/LRA.2024.3368301>paper</a> | <a href=https://github.com/vehicle-importance/oiecr>link</a></summary>
