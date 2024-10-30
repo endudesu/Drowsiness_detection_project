@@ -1,5 +1,5 @@
 
-<summary>gankush's Fatigue Detection using Pose Estimation|<a href=https://github.com/wzafar/capstone-project/tree/mainlink</a></summary>
+<summary>gankush's Fatigue Detection using Pose Estimation | <a href=https://github.com/wzafar/capstone-project/tree/mainlink</a>link</summary>
 
 
 
