@@ -1,137 +1,173 @@
 import cv2
-import dlib
-import torch
-from scipy.spatial import distance as dist
-from imutils import face_utils
-from ultralytics import YOLO
-from threading import Thread
-from playsound import playsound
 import numpy as np
+import mediapipe as mp
+from scipy.spatial import distance as dist
+import time
+from collections import deque
+from ultralytics import YOLO
 
-def play_alarm(path):
-    playsound(path)
+def calculate_ear(eye_landmarks):
+    A = dist.euclidean(eye_landmarks[1], eye_landmarks[5])
+    B = dist.euclidean(eye_landmarks[2], eye_landmarks[4])
+    C = dist.euclidean(eye_landmarks[0], eye_landmarks[3])
+    ear = (A + B) / (2.0 * C)
+    return ear
+
+def calculate_head_pose(face_landmarks, frame_width, frame_height):
+    # 머리 포즈 계산을 위한 주요 랜드마크
+    nose = face_landmarks.landmark[1]
+    left_eye = face_landmarks.landmark[33]
+    right_eye = face_landmarks.landmark[263]
+    mouth_left = face_landmarks.landmark[57]
+    mouth_right = face_landmarks.landmark[287]
+
+    # 3D 좌표로 변환
+    nose_3d = np.array([nose.x * frame_width, nose.y * frame_height, nose.z * 3000])
+    left_eye_3d = np.array([left_eye.x * frame_width, left_eye.y * frame_height, left_eye.z * 3000])
+    right_eye_3d = np.array([right_eye.x * frame_width, right_eye.y * frame_height, right_eye.z * 3000])
+
+    # 머리 기울기 계산
+    eye_center = (left_eye_3d + right_eye_3d) / 2
+    vertical_angle = np.arctan2(nose_3d[1] - eye_center[1], nose_3d[2] - eye_center[2])
+    return np.degrees(vertical_angle)
 
 def detect_drowsiness(video_paths):
-    # YOLOv11m 모델 초기화
-    model = YOLO('yolo11m.pt')
+    # YOLO 모델 초기화
+    yolo_model = YOLO('yolov8n.pt')
 
-    # CUDA 사용 설정
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    print(device)
+    # MediaPipe 초기화
+    mp_face_mesh = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh.FaceMesh(
+        max_num_faces=5,
+        refine_landmarks=True,
+        min_detection_confidence=0.3,
+        min_tracking_confidence=0.3
+    )
 
-    # 얼굴 랜드마크 예측기 초기화
-    predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
-
-    # 3D 모델 포인트
-    model_points = np.array([
-        (0.0, 0.0, 0.0),             # Nose tip
-        (0.0, -330.0, -65.0),        # Chin
-        (-225.0, 170.0, -135.0),     # Left eye left corner
-        (225.0, 170.0, -135.0),      # Right eye right corner
-        (-150.0, -150.0, -125.0),    # Left Mouth corner
-        (150.0, -150.0, -125.0)      # Right mouth corner
-    ])
-
-    ear_threshold = 0.25
-    consec_frames = 15  # 연속 프레임 수 조정
+    # 눈 랜드마크 인덱스
+    LEFT_EYE = [362, 385, 387, 263, 373, 380]
+    RIGHT_EYE = [33, 160, 158, 133, 153, 144]
+    
+    # 파라미터 설정
+    EAR_THRESHOLD = 0.2
+    HEAD_ANGLE_THRESHOLD = 20  # 머리 기울기 임계값
+    MOVEMENT_THRESHOLD = 30    # 움직임 임계값
+    CONSEC_FRAMES_THRESHOLD = 10
+    
+    # 이전 프레임의 머리 위치를 저장하는 큐
+    head_positions = deque(maxlen=10)
 
     for video_path in video_paths:
         cap = cv2.VideoCapture(video_path)
-        frame_counter = 0
-        flag = False
+        prev_time = time.time()
+        drowsy_counter = 0
+        prev_head_angle = None
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # 프레임 크기 조정
-            frame = cv2.resize(frame, (640, 360))
+            current_time = time.time()
+            fps = 1 / (current_time - prev_time)
+            prev_time = current_time
 
-            # YOLO를 사용하여 사람 감지
-            results = model(frame, device=device)
-            detections = results[0].boxes  # 감지된 객체의 바운딩 박스
+            frame = cv2.resize(frame, (1280, 720))
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            for box in detections:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])  # 바운딩 박스 좌표
-                cls = int(box.cls[0])  # 클래스 ID
-                if cls == 0:  # class 0은 'person'
-                    roi_gray = frame[y1:y2, x1:x2]
-                    gray = cv2.cvtColor(roi_gray, cv2.COLOR_BGR2GRAY)
+            # YOLO로 사람 검출
+            yolo_results = yolo_model(frame, classes=[0], conf=0.3)
+            
+            for result in yolo_results:
+                boxes = result.boxes
+                for box in boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    person_roi = frame[y1:y2, x1:x2]
+                    if person_roi.size == 0:
+                        continue
 
-                    # 얼굴 랜드마크 추출
-                    rects = dlib.get_frontal_face_detector()(gray, 0)
-                    for rect in rects:
-                        shape = predictor(gray, rect)
-                        shape = face_utils.shape_to_np(shape)
+                    # Face Mesh 처리
+                    face_mesh_results = face_mesh.process(cv2.cvtColor(person_roi, cv2.COLOR_BGR2RGB))
+                    
+                    if face_mesh_results.multi_face_landmarks:
+                        for face_landmarks in face_mesh_results.multi_face_landmarks:
+                            # 머리 포즈 계산
+                            head_angle = calculate_head_pose(face_landmarks, person_roi.shape[1], person_roi.shape[0])
+                            
+                            # 현재 머리 위치 저장
+                            nose_pos = face_landmarks.landmark[1]
+                            current_pos = (nose_pos.x, nose_pos.y, nose_pos.z)
+                            head_positions.append(current_pos)
 
-                        # 2D 이미지 포인트
-                        image_points = np.array([
-                            (shape[30][0], shape[30][1]),  # Nose tip
-                            (shape[8][0], shape[8][1]),    # Chin
-                            (shape[36][0], shape[36][1]),  # Left eye left corner
-                            (shape[45][0], shape[45][1]),  # Right eye right corner
-                            (shape[48][0], shape[48][1]),  # Left Mouth corner
-                            (shape[54][0], shape[54][1])   # Right mouth corner
-                        ], dtype='double')
+                            # 머리 움직임 분석
+                            movement = 0
+                            if len(head_positions) > 1:
+                                prev_pos = head_positions[-2]
+                                movement = np.sqrt(
+                                    (current_pos[0] - prev_pos[0])**2 +
+                                    (current_pos[1] - prev_pos[1])**2 +
+                                    (current_pos[2] - prev_pos[2])**2
+                                ) * 1000
 
-                        # 카메라 내부 매개변수
-                        size = frame.shape
-                        focal_length = size[1]
-                        center = (size[1]/2, size[0]/2)
-                        camera_matrix = np.array([[focal_length, 0, center[0]], [0, focal_length, center[1]], [0, 0, 1]], dtype="double")
+                            # 눈 EAR 계산
+                            try:
+                                left_eye = [(int(landmark.x * person_roi.shape[1]) + x1, 
+                                           int(landmark.y * person_roi.shape[0]) + y1) 
+                                          for landmark in [face_landmarks.landmark[i] for i in LEFT_EYE]]
+                                right_eye = [(int(landmark.x * person_roi.shape[1]) + x1, 
+                                            int(landmark.y * person_roi.shape[0]) + y1) 
+                                           for landmark in [face_landmarks.landmark[i] for i in RIGHT_EYE]]
+                                
+                                left_ear = calculate_ear(np.array(left_eye))
+                                right_ear = calculate_ear(np.array(right_eye))
+                                ear = (left_ear + right_ear) / 2.0
+                            except:
+                                ear = 1.0  # 눈이 잘 보이지 않는 경우
 
-                        dist_coeffs = np.zeros((4, 1))  # 렌즈 왜곡 없음 가정
-                        (success, rotation_vector, translation_vector) = cv2.solvePnP(model_points, image_points, camera_matrix, dist_coeffs)
+                            # 졸음 상태 판단 및 색상 초기화
+                            is_drowsy = False
+                            status = "Alert"
+                            color = (0, 255, 0)  # 기본 색상 (초록색)
+                            
+                            # 1. EAR 기반 졸음 감지
+                            if ear < EAR_THRESHOLD:
+                                is_drowsy = True
+                            
+                            # 2. 머리 기울기 기반 졸음 감지
+                            if abs(head_angle) > HEAD_ANGLE_THRESHOLD:
+                                is_drowsy = True
+                            
+                            # 3. 급격한 머리 움직임 감지
+                            if movement > MOVEMENT_THRESHOLD:
+                                is_drowsy = True
 
-                        (nose_end_point2D, jacobian) = cv2.projectPoints(np.array([(0.0, 0.0, 1000.0)]), 
-                                                                         rotation_vector, translation_vector, camera_matrix, dist_coeffs)
+                            if is_drowsy:
+                                drowsy_counter += 1
+                                if drowsy_counter >= CONSEC_FRAMES_THRESHOLD:
+                                    status = "Drowsy"
+                                    color = (0, 0, 255)  # 빨간색
+                            else:
+                                drowsy_counter = max(0, drowsy_counter - 1)
 
-                        for p in image_points:
-                            cv2.circle(frame, (int(p[0]), int(p[1])), 3, (0, 0, 255), -1)
+                            # 상태 표시
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                            cv2.putText(frame, f"{status}", (x1, y1 - 10),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                            
+                            # 추가 정보 표시
+                            info_y = 30
+                            cv2.putText(frame, f"Head Angle: {head_angle:.1f}", (10, info_y),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                            cv2.putText(frame, f"Movement: {movement:.1f}", (10, info_y + 30),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                            if ear != 1.0:
+                                cv2.putText(frame, f"EAR: {ear:.2f}", (10, info_y + 60),
+                                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-                        p1 = (int(image_points[0][0]), int(image_points[0][1]))
-                        p2 = (int(nose_end_point2D[0][0][0]), int(nose_end_point2D[0][0][1]))
+            cv2.putText(frame, f"FPS: {int(fps)}", (10, 90),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-                        cv2.line(frame, p1, p2, (255, 0, 0), 2)
-
-                        # 회전 벡터를 사용하여 Euler 각도 계산
-                        rmat, jac = cv2.Rodrigues(rotation_vector)
-                        angles, mtxR, mtxQ, Qx, Qy, Qz = cv2.RQDecomp3x3(rmat)
-
-                        y = np.arctan2(-Qy[2][0], np.sqrt((Qy[2][1] * Qy[2][1]) + (Qy[2][2] * Qy[2][2])))
-
-                        if angles[1] < -15:
-                            GAZE = "Looking: Left"
-                            cv2.putText(frame, GAZE, (20, 20), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 80), 2)
-                        elif angles[1] > 15:
-                            GAZE = "Looking: Right"
-                            cv2.putText(frame, GAZE, (20, 20), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 80), 2)
-                        else:
-                            GAZE = "Forward"
-                            cv2.putText(frame, GAZE, (20, 20), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 80), 2)
-
-                        cv2.putText(frame, "rotation: {:.2f}".format(y), (300, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-                        if y > 0.6 or y < -0.6:
-                            frame_counter += 1
-
-                            if frame_counter >= consec_frames:
-                                if not flag:
-                                    flag = True
-                                    # 알람을 재생하는 새로운 스레드 시작
-                                    t = Thread(target=play_alarm, args=('../alarm_trimmed.mp3',))
-                                    t.deamon = True
-                                    t.start()
-
-                                cv2.putText(frame, "LOOK AT ROAD", (800, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-                        else:
-                            frame_counter = 0
-                            flag = False
-
-            cv2.imshow("Frame", frame)
+            cv2.imshow("Drowsiness Detection", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
